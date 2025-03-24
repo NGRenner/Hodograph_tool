@@ -1,0 +1,31 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from metpy.calc import wind_components
+from metpy.units import units
+
+# Example wind profile (speed in knots, direction in degrees)
+wind_speeds = np.array([5, 10, 15, 20, 25, 30, 35]) * units.knots
+wind_directions = np.array([180, 200, 220, 240, 260, 280, 300]) * units.degrees
+
+# Convert to U, V components
+u, v = wind_components(wind_speeds, wind_directions)
+
+# Convert wind direction to radians for polar plot
+theta = np.deg2rad(270 - wind_directions.m)  # Convert meteorological to standard polar angle
+r = wind_speeds.m  # Wind speed as radius
+
+# Create polar plot
+fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(6,6))
+ax.plot(theta, r, marker='o', linestyle='-', color='b', label="Hodograph")
+
+# Customizing the plot
+ax.set_theta_zero_location("N")  # Set North (0°) at the top
+ax.set_theta_direction(-1)  # Set clockwise direction (meteorological convention)
+ax.set_rlim(0, np.max(r) + 5)  # Set radial limit
+ax.set_rticks(np.arange(0, np.max(r) + 5, 5))  # Set radial grid lines
+ax.set_xticks(np.radians([0, 90, 180, 270]))  # Set azimuthal grid labels
+ax.set_xticklabels(["N", "E", "S", "W"])  # Label directions
+
+ax.set_title("Wind Hodograph (Radial Plot)")
+plt.legend()
+plt.show()
