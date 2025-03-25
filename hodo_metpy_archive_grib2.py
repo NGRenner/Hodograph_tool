@@ -18,7 +18,7 @@ from metpy.units import units
 import tkinter as tk
 from tkinter import filedialog
 import pygrib
-
+import cfgrib
 
 
 def get_elevation_pygrib(file_path, lat_target, lon_target):
@@ -356,7 +356,7 @@ if __name__ == "__main__":
 
     data_file = filedialog.askopenfilename(
         title="Select RAP GRIB2 File",
-        filetypes=[("GRIB2 files", "*.grb2")]
+        filetypes=[("GRIB2 files", "*.grib2")]
     )
 
     if data_file:

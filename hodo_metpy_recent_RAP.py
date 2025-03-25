@@ -6,12 +6,11 @@ import xarray as xr
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from tqdm import tqdm
-from scipy.interpolate import griddata
-from scipy.interpolate import interp1d
+from scipy.interpolate import griddata, interp1d
 import pandas as pd
 import matplotlib.colors as mcolors
 from metpy.plots import Hodograph
-from metpy.calc import wind_speed, wind_direction, bunkers_storm_motion
+from metpy.calc import wind_speed, wind_direction, bunkers_storm_motion, storm_relative_helicity
 from metpy.units import units
 import pygrib
 
@@ -20,39 +19,72 @@ NOMADS_URL = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/rap/prod/"
 
 def get_latest_rap_file():
     """
-    Determines the most recent RAP GRIB2 file from NOMADS, ensuring it exists before returning.
+    Determines the most recent RAP GRIB2 run by checking today's (or yesterday's) directory.
+    It computes the valid times for the latest cycle (from the file names) and prompts the user
+    to select one by its index. The valid time is given in Zulu (UTC) format.
+    Returns a tuple (latest_url, latest_file) or None if not found.
     """
     now = datetime.utcnow()
-    
     for attempt in range(2):  # Try today, then yesterday if needed
         date_str = now.strftime('%Y%m%d')
         rap_dir = f"rap.{date_str}/"
         url = f"{NOMADS_URL}{rap_dir}"
-
+        
         response = requests.get(url)
         if response.status_code != 200:
-            now -= timedelta(days=1)  # Go back one day
+            now -= timedelta(days=1)
             continue  # Retry with the previous day
         
         # Find all GRIB2 files (excluding .idx files)
-        files = re.findall(r'rap\.t(\d{2})z\.awp130pgrbf(\d{2})\.grib2(?<!\.idx)', response.text)
+        files = list(set(re.findall(r'rap\.t(\d{2})z\.awp130pgrbf(\d{2})\.grib2(?<!\.idx)', response.text)))
         if not files:
-            now -= timedelta(days=1)  # Go back one day
+            now -= timedelta(days=1)
             continue  # Retry with the previous day
-
-        # Sort files by latest cycle and forecast hour
-        files = sorted(files, key=lambda x: (int(x[0]), int(x[1])), reverse=True)
-        latest_cycle, latest_fxx = files[0]
-        latest_file = f"rap.t{latest_cycle}z.awp130pgrbf{latest_fxx}.grib2"
-        latest_url = f"{url}{latest_file}"
-
-        return latest_url, latest_file
-
+        
+        # Build list of tuples: (cycle, forecast, file_name)
+        available = [(cycle, fxx, f"rap.t{cycle}z.awp130pgrbf{fxx}.grib2") for (cycle, fxx) in files]
+        # Get the unique cycles and choose the latest cycle
+        cycles = sorted(set([t[0] for t in available]), reverse=True)
+        latest_cycle = cycles[0]
+        # Filter files for the latest cycle only and sort by forecast hour
+        files_for_latest = sorted([t for t in available if t[0] == latest_cycle], key=lambda t: int(t[1]))
+        
+        # Compute the run time from the date and cycle hour.
+        base_date = datetime.strptime(date_str, "%Y%m%d")
+        run_time = base_date + timedelta(hours=int(latest_cycle))
+        
+        # Compute valid times for each forecast hour
+        valid_list = []
+        for t in files_for_latest:
+            fxx = t[1]
+            valid_time = run_time + timedelta(hours=int(fxx))
+            valid_list.append((valid_time, t[2]))
+        
+        # List available valid times (Zulu time)
+        print(f"Available valid times for RAP run (cycle {latest_cycle}Z) on {date_str}:")
+        for i, (vt, fname) in enumerate(valid_list):
+            print(f"{i}: {vt.strftime('%Y-%m-%d %HZ')}  -  File: {fname}")
+        
+        # Prompt the user to select a valid time by index
+        index = input("Enter the index of the desired valid time: ").strip()
+        try:
+            index = int(index)
+            if 0 <= index < len(valid_list):
+                selected_file = valid_list[index][1]
+                latest_url = f"{url}{selected_file}"
+                return latest_url, selected_file
+            else:
+                print("Invalid index. Exiting.")
+                return None
+        except ValueError:
+            print("Invalid input. Exiting.")
+            return None
     print("⚠️ No valid RAP .grib2 files found! The data may not be available yet.")
     return None
+
 def download_rap_file():
     """
-    Checks if the latest RAP file exists locally; if not, downloads it.
+    Checks if the selected RAP file exists locally; if not, downloads it.
     Returns the local file path.
     """
     result = get_latest_rap_file()
@@ -113,6 +145,46 @@ def get_elevation_pygrib(file_path, lat_target, lon_target):
     min_index = np.unravel_index(np.argmin(dist), dist.shape)
     elevation_at_point = elevations[min_index]
     return elevation_at_point
+
+def calculate_critical_angle(u_profile, v_profile, z_agl_km, storm_motion):
+    """
+    Calculates the critical angle between the low-level shear vector (0-1 km)
+    and the storm-relative wind vector. Returns the angle in radians.
+    """
+    # Get surface wind
+    idx_sfc = np.argmin(np.abs(z_agl_km - 0))
+    u_sfc = u_profile[idx_sfc].to('m/s').magnitude
+    v_sfc = v_profile[idx_sfc].to('m/s').magnitude
+
+    # Get 1 km wind
+    idx_1km = np.argmin(np.abs(z_agl_km - 1))
+    u_1km = u_profile[idx_1km].to('m/s').magnitude
+    v_1km = v_profile[idx_1km].to('m/s').magnitude
+
+    # Calculate shear vector (0–1 km)
+    shear_u = u_1km - u_sfc
+    shear_v = v_1km - v_sfc
+
+    # Storm motion relative to sfc wind
+    rm_u = storm_motion[0].to('m/s').magnitude
+    rm_v = storm_motion[1].to('m/s').magnitude
+
+    storm_rel_u = rm_u - u_sfc
+    storm_rel_v = rm_v - v_sfc
+
+    # Compute angle between vectors
+    shear_vec = np.array([shear_u, shear_v])
+    storm_vec = np.array([storm_rel_u, storm_rel_v])
+
+    shear_mag = np.linalg.norm(shear_vec)
+    storm_mag = np.linalg.norm(storm_vec)
+
+    if shear_mag == 0 or storm_mag == 0:
+        return np.nan
+
+    cos_theta = np.dot(shear_vec, storm_vec) / (shear_mag * storm_mag)
+    angle_rad = np.arccos(np.clip(cos_theta, -1.0, 1.0))
+    return angle_rad   # <-- Added return statement
 
 def plot_hodograph(data_file, lat, lon):
     """
@@ -206,22 +278,73 @@ def plot_hodograph(data_file, lat, lon):
     
         print(f"AGL range at this location: {z_agl_km.min():.2f} km to {z_agl_km.max():.2f} km")
     print(f"Available geopotential height range: {np.min(z_m):.2f} m to {np.max(z_m):.2f} m")
-    # --- 6) Plot the hodograph ---
-    fig, ax = plt.subplots(figsize=(6,6))
-    h = Hodograph(ax, component_range=40)
+
+    fig, (ax_hodo, ax_barbs) = plt.subplots(
+    1, 2,
+    figsize=(9, 6),
+    width_ratios=[3, 0.3]  # start with something reasonable
+    )
+    fig.subplots_adjust(wspace=0.15)  # tighter spacing between axes
+    pos = ax_barbs.get_position()
+    ax_barbs.set_position([pos.x0 - 0.02, pos.y0, pos.width, pos.height])  # move left by 0.02
+
+    h = Hodograph(ax_hodo, component_range=40)
     h.add_grid(increment=10)
+
      # Convert to proper units
     pressure_profile = np.array(levels) * units.hPa            # Already in levels list
     u_profile = u_interp * units('m/s')
     v_profile = v_interp * units('m/s')
     height_profile = z_agl_m * units('meter')  # AGL heights in meters
+
+    # --- Vertical Wind Profile (barbs) ---
+    # Use 0–12 km wind profile (adjust as needed)
+    max_height_km = 12
+    idx_max = np.argmax(z_agl_km >= max_height_km) if np.any(z_agl_km >= max_height_km) else len(z_agl_km)
+    # Plot barbs (convert to units matplotlib expects)
+    u_barbs = u_profile[:idx_max].to('knots').magnitude
+    v_barbs = v_profile[:idx_max].to('knots').magnitude
+    z_barbs = z_agl_km[:idx_max]
+    ax_barbs.barbs(np.zeros_like(z_barbs), z_barbs, u_barbs, v_barbs, length=6)
+    ax_barbs.set_ylim(ax_barbs.get_ylim()[0] - 0.5, max_height_km)
+    ax_barbs.set_xlim(-1, 1)  # narrow x-range to center barbs
+    ax_barbs.set_xticks([])
+    ax_barbs.set_ylabel("Height AGL (km)")
+    ax_hodo.set_title("Hodograph", fontsize=12)
+    ax_barbs.set_title("Wind Profile", fontsize=12)
+    
+   
     # Extract surface wind (0 km AGL)
     idx_surface = np.argmin(np.abs(z_agl_km - 0))  # Find nearest index to surface
   
     # Calculate storm motions
     rm, lm, mean = bunkers_storm_motion(pressure_profile, u_profile, v_profile, height_profile)
 
-  
+    crit_angle = calculate_critical_angle(u_profile, v_profile, z_agl_km, rm)
+    print(f"Critical Angle (0–0.5 km): {crit_angle:.1f}°")
+
+    idx_3km = np.argmin(np.abs(z_agl_km - 3))
+    u_srh = u_profile[:idx_3km + 1]  # Already has units, for the area filling
+    v_srh = v_profile[:idx_3km + 1]
+    
+    # Compute 0–3 km SRH using MetPy 1.6.3 syntax
+    srh_0_3km, _, _ = storm_relative_helicity(
+        z_agl_m * units.meter,
+        u_profile,
+        v_profile,
+        3000 * units.meter,
+        storm_u=rm[0],
+        storm_v=rm[1]
+    )
+    # Convert to floats for plotting
+    u_plot = u_srh.magnitude
+    v_plot = v_srh.magnitude
+    rm_u = rm[0].magnitude
+    rm_v = rm[1].magnitude
+    # Build the polygon: storm motion point + wind profile (0–3 km) + back to storm motion
+    poly_u = np.concatenate([[rm_u], u_plot, [rm_u]])
+    poly_v = np.concatenate([[rm_v], v_plot, [rm_v]])
+
     # Compute storm-relative wind vector (Surface → BRM)
     u_sfc = u_profile[idx_surface].magnitude
     v_sfc = v_profile[idx_surface].magnitude
@@ -235,8 +358,20 @@ def plot_hodograph(data_file, lat, lon):
     
     # Plot storm-relative wind vector (Surface → BRM)
   
+    # Convert storm motion to floats
+    rm_u, rm_v = rm[0].magnitude, rm[1].magnitude
+
   
-  
+
+   # Plot the correctly aligned SRH lobe
+    ax_hodo.fill(poly_u, poly_v, color='lightblue', alpha=0.4, zorder=2)
+
+    ax_hodo.text(0.02, 0.02,
+                f"0–3 km SRH: {srh_0_3km:.0f} m²/s²",
+                transform=ax_hodo.transAxes,
+                fontsize=10, color='navy',
+                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+            
     # Find the 3 km wind
     idx_3km = np.argmin(np.abs(z_agl_km - 3))
     u_3km = u_profile[idx_3km].magnitude
@@ -245,32 +380,37 @@ def plot_hodograph(data_file, lat, lon):
     rm_v = rm[1].magnitude
     
     # Plot Surface → BRM (Storm-Relative Wind)
-    ax.plot([u_sfc, rm_u], 
+    ax_hodo.plot([u_sfc, rm_u], 
             [v_sfc, rm_v], 
             color='blue', linewidth=1.5, linestyle='-', alpha=0.8)
 
     # Plot BRM → 3km Wind
-    ax.plot([rm_u, u_3km], 
+    ax_hodo.plot([rm_u, u_3km], 
             [rm_v, v_3km], 
             color='blue', linewidth=1.5, linestyle='-', alpha=0.8)
 
     # Label the segments
-    ax.text((u_sfc + rm_u) / 2, 
+    ax_hodo.text((u_sfc + rm_u) / 2, 
             (v_sfc + rm_v) / 2, 
             "SRW", color='blue', fontsize=8, ha='center', va='bottom')
 
-    ax.text((rm_u + u_3km) / 2, 
+    ax_hodo.text((rm_u + u_3km) / 2, 
             (rm_v + v_3km) / 2, 
-            "0-3km SRH", color='blue', fontsize=8, ha='center', va='bottom')
+            "0-3km SRH", color='blue', fontsize=9, ha='center', va='bottom')
+    ax_hodo.text(0.02, 0.08,
+             f"Critical Angle: {crit_angle:.1f}°",
+             transform=ax_hodo.transAxes,
+             fontsize=9, color='darkgreen',
+             bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
 # Plot hollow circles
-    ax.scatter(rm_u, rm_v, facecolors='none', edgecolors='red', marker='o', s=60, zorder=10)
-    ax.scatter(lm_u, lm_v, facecolors='none', edgecolors='blue', marker='o', s=60, zorder=10)
-    ax.scatter(mean_u, mean_v, facecolors='none', edgecolors='green', marker='o', s=60, zorder=10)
+    ax_hodo.scatter(rm_u, rm_v, facecolors='none', edgecolors='red', marker='o', s=60, zorder=10)
+    ax_hodo.scatter(lm_u, lm_v, facecolors='none', edgecolors='blue', marker='o', s=60, zorder=10)
+    ax_hodo.scatter(mean_u, mean_v, facecolors='none', edgecolors='green', marker='o', s=60, zorder=10)
 
     # Label each marker
-    ax.text(rm_u + 1, rm_v, 'BRM', color='red', fontsize=9, va='center')
-    ax.text(lm_u + 1, lm_v, 'BLM', color='blue', fontsize=9, va='center')
-    ax.text(mean_u + 1, mean_v, '0-6km MW', color='green', fontsize=9, va='center')
+    ax_hodo.text(rm_u + 1, rm_v, 'BRM', color='red', fontsize=9, va='center')
+    ax_hodo.text(lm_u + 1, lm_v, 'BLM', color='blue', fontsize=9, va='center')
+    ax_hodo.text(mean_u + 1, mean_v, '0-6km MW', color='green', fontsize=9, va='center')
 
     num_points = len(u_interp)
     if num_points > 1:
@@ -289,31 +429,36 @@ def plot_hodograph(data_file, lat, lon):
     interp_func_u = interp1d(z_agl_km, u_interp, kind='linear', bounds_error=False, fill_value="extrapolate")
     interp_func_v = interp1d(z_agl_km, v_interp, kind='linear', bounds_error=False, fill_value="extrapolate")
 
+    # Convert times to pandas Timestamps (assuming they are scalar values)
+    rt = pd.to_datetime(ds_u.time.values)
+    vt = pd.to_datetime(ds_u.valid_time.values)
+    fcst_hour = int((vt - rt).total_seconds() // 3600)
     for alt in alt_markers:
         if np.min(z_agl_km) <= alt <= np.max(z_agl_km):  # Ensure within available heights
             u_alt = interp_func_u(alt)
             v_alt = interp_func_v(alt)
             
-            ax.scatter(u_alt, v_alt, color='black', s=30, zorder=5)
-            ax.text(u_alt + 1.0, v_alt, f"{alt} km",
+            ax_hodo.scatter(u_alt, v_alt, color='black', s=30, zorder=5)
+            ax_hodo.text(u_alt + 1.0, v_alt, f"{alt} km",
                     fontsize=9, color='black', ha='left', va='center', zorder=6)
 
     # --- 8) Annotate metadata ---
     metadata_text = (
-        f"RAP {run_time}, F000\n"
-        f"VALID: {valid_time}\n"
-        f"AT: {lat:.2f}°N, {lon:.2f}°{'W' if lon < 0 else 'E'}"
-    )
-    ax.text(0.02, 0.98, metadata_text, transform=ax.transAxes, fontsize=10,
+    f"RAP {rt.strftime('%Y-%m-%d %HZ')}, F{fcst_hour:03d}\n"
+    f"VALID: {vt.strftime('%a %Y-%m-%d %HZ')}\n"
+    f"AT: {lat:.2f}°N, {lon:.2f}°{'W' if lon < 0 else 'E'}"
+)
+    ax_hodo.text(0.02, 0.98, metadata_text, transform=ax_hodo.transAxes, fontsize=10,
             verticalalignment='top', horizontalalignment='left',
             bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', boxstyle="round,pad=0.3"),
             color='white')
 
-    plt.title(f'Hodograph for {lat:.2f}, {lon:.2f}')
     plt.show()
+
 
 if __name__ == "__main__":
     data_file = download_rap_file()
     if data_file:
-        
+        # Example: Prompt user for desired coordinates or hard-code them
+        # Here we use an example location.
         plot_hodograph(data_file, lat=46.36, lon=-96.28)
