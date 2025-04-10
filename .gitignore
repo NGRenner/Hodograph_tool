@@ -1,3 +1,6 @@
 *.grib2
 *.idx
 *.grb2
+*.gif
+*.png
+*

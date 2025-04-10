@@ -1,7 +1,3 @@
-# Use this script if you want load your own .grib2 files to make a hodograph and a vertical wind barb profile. 
-# itll ask for a for 
-
-
 import os
 import requests
 import re
@@ -18,6 +14,176 @@ from metpy.calc import wind_speed, wind_direction, bunkers_storm_motion, storm_r
 from metpy.units import units
 import pygrib
 
+# Model‑specific information for NOMADS
+model_info = {
+    "rap": {
+        "base": "http://nomads.ncep.noaa.gov/pub/data/nccf/com/rap/prod/",
+        "folder": "rap",
+        "regex": r'rap\.t(\d{2})z\.awp130pgrbf(\d{2})\.grib2(?<!\.idx)'
+    },
+    "nam": {
+        "base": "http://nomads.ncep.noaa.gov/pub/data/nccf/com/nam/prod/",
+        "folder": "nam",
+        # Updated regex for NAM: pattern "nam.tHHz.awip12BB.tm00.grib2"
+        "regex": r'nam\.t(\d{2})z\.awphys(\d{2})\.tm00\.grib2'
+    },
+    "gfs": {
+        "base": "http://nomads.ncep.noaa.gov/pub/data/nccf/com/gfs/prod/",
+        "folder": "gfs",
+        "subfolder": "atmos/",
+        "regex": r'gfs\.t(\d{2})z\.pgrb2full\.0p50\.f(\d{3})'
+    }
+}
+
+# RAP functions (same for rap and NAM)
+def get_available_model_cycles(model):
+    info = model_info[model]
+    now = datetime.utcnow()
+    for attempt in range(2):
+        date_str = now.strftime('%Y%m%d')
+        folder = f"{info['folder']}.{date_str}/"
+        base_url = info["base"] + folder
+        response = requests.get(base_url)
+        if response.status_code != 200:
+            now -= timedelta(days=1)
+            continue
+        files = re.findall(info["regex"], response.text)
+        if not files:
+            now -= timedelta(days=1)
+            continue
+        available = [(cycle, fxx, f"{info['folder']}.t{cycle}z.awp130pgrbf{fxx}.grib2") for (cycle, fxx) in files]
+        available = list(set(available))
+        cycles = sorted(set([t[0] for t in available]), reverse=True)
+        return base_url, available, cycles, date_str
+    print("⚠️ No valid GRIB2 files found for", model)
+    return None, None, None, None
+
+# NAM-specific functions
+def get_available_nam_dates():
+    base_url = model_info["nam"]["base"]
+    response = requests.get(base_url)
+    if response.status_code != 200:
+        print("Could not access NAM base directory.")
+        return None, None
+    # Extract directories in the form "nam.YYYYMMDD"
+    dates = re.findall(r'nam\.(\d{8})', response.text)
+    dates = sorted(set(dates), reverse=True)
+    return base_url, dates
+
+def get_available_nam_cycle(base_url, chosen_date):
+    # NAM date directory is like "nam.YYYYMMDD/"
+    date_folder = f"nam.{chosen_date}/"
+    full_url = base_url + date_folder
+    response = requests.get(full_url)
+    if response.status_code != 200:
+        print("Could not access NAM date folder:", full_url)
+        return None, None
+    # Use the NAM regex to extract cycle values from the file names
+    matches = re.findall(model_info["nam"]["regex"], response.text)
+    if not matches:
+        print("No NAM files found in the directory.")
+        return None, None
+    cycles = sorted(set([m[0] for m in matches]), reverse=True)
+    return full_url, cycles
+
+def get_available_nam_valid_times(full_url, chosen_cycle, chosen_date):
+    info = model_info["nam"]
+    response = requests.get(full_url)
+    if response.status_code != 200:
+        print("Could not access NAM date folder:", full_url)
+        return None, None
+    files = re.findall(info["regex"], response.text)
+    if not files:
+        print("No valid NAM files found in the directory.")
+        return None, None
+    available_files = []
+    for (cycle, fxx) in files:
+        fname = f"nam.t{cycle}z.awphys{fxx}.tm00.grib2"
+        available_files.append((cycle, fxx, fname))
+    # Filter available files to only those with the chosen cycle
+    available_files = [item for item in available_files if item[0] == chosen_cycle]
+    if not available_files:
+        print("No valid NAM files found for cycle", chosen_cycle)
+        return None, None
+    available_files = sorted(list(set(available_files)), key=lambda t: int(t[1]))
+    base_date = datetime.strptime(chosen_date, "%Y%m%d")
+    run_time = base_date + timedelta(hours=int(chosen_cycle))
+    valid_list = []
+    for t in available_files:
+        fxx = t[1]
+        valid_time = run_time + timedelta(hours=int(fxx))
+        valid_list.append((valid_time, t[2], fxx))
+    return full_url, valid_list
+
+# GFS functions (unchanged)
+def get_available_gfs_dates():
+    base_url = model_info["gfs"]["base"]
+    response = requests.get(base_url)
+    if response.status_code != 200:
+        print("Could not access GFS base directory.")
+        return None, None
+    dates = re.findall(r'gfs\.(\d{8})', response.text)
+    dates = sorted(set(dates), reverse=True)
+    return base_url, dates
+
+def get_available_gfs_cycle(base_url, chosen_date):
+    date_folder = f"gfs.{chosen_date}/"
+    full_url = base_url + date_folder
+    response = requests.get(full_url)
+    if response.status_code != 200:
+        print("Could not access GFS date folder:", full_url)
+        return None, None
+    cycles = re.findall(r'>(\d{2})/', response.text)
+    cycles = sorted(set(cycles), reverse=True)
+    return full_url, cycles
+
+def get_available_gfs_valid_times(base_url_date, chosen_cycle):
+    info = model_info["gfs"]
+    final_base_url = base_url_date + f"{chosen_cycle}/" + info["subfolder"]
+    response = requests.get(final_base_url)
+    if response.status_code != 200:
+        print("Could not access GFS subfolder for cycle", chosen_cycle)
+        return None, None
+    files = re.findall(info["regex"], response.text)
+    if not files:
+        print("No valid GFS files found in subfolder for cycle", chosen_cycle)
+        return None, None
+    available_files = []
+    for (cycle, fxx) in files:
+        fname = f"gfs.t{cycle}z.pgrb2full.0p50.f{fxx}"
+        available_files.append((cycle, fxx, fname))
+    available_files = sorted(list(set(available_files)), key=lambda t: int(t[1]))
+    base_date = datetime.strptime(chosen_date, "%Y%m%d")
+    run_time = base_date + timedelta(hours=int(chosen_cycle))
+    valid_list = []
+    for t in available_files:
+        fxx = t[1]
+        valid_time = run_time + timedelta(hours=int(fxx))
+        valid_list.append((valid_time, t[2], fxx))
+    return final_base_url, valid_list
+
+def download_model_file(file_name, base_url):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(script_dir, file_name)
+    if os.path.exists(file_path):
+        print(f"✅ File already exists: {file_path}")
+        return file_path
+    url = f"{base_url}{file_name}"
+    print(f"Downloading: {url}")
+    response = requests.get(url, stream=True)
+    if response.status_code == 200:
+        total_size = int(response.headers.get('content-length', 0))
+        with open(file_path, 'wb') as f, tqdm(
+            desc="Downloading File", total=total_size, unit='B', unit_scale=True, unit_divisor=1024
+        ) as bar:
+            for chunk in response.iter_content(chunk_size=1024):
+                f.write(chunk)
+                bar.update(len(chunk))
+        print(f"✅ Downloaded file: {file_path}")
+        return file_path
+    else:
+        print("❌ Failed to download file.")
+        return None
 
 def get_elevation_pygrib(file_path, lat_target, lon_target):
     grbs = pygrib.open(file_path)
@@ -297,19 +463,87 @@ def plot_hodograph(data_file, lat, lon, model, output_file=None):
         plt.show()
 
 if __name__ == "__main__":
-    from tkinter import Tk
-    from tkinter.filedialog import askopenfilename
-
-    Tk().withdraw()  # Hide root window
-    file_path = askopenfilename(title="Select GRIB2 File", filetypes=[("GRIB2 files", "*.grb2"), ("All files", "*.*")])
-    
-    if not file_path:
-        print("No file selected. Exiting.")
+    model = input("Enter model (rap, nam, or gfs): ").strip().lower()
+    if model not in model_info:
+        print("Invalid model selection. Exiting.")
         exit()
-
+    if model == "rap":
+        base_url, available, cycles, date_str = get_available_model_cycles(model)
+        if available is None:
+            exit()
+        print("Available RAP cycles:")
+        for i, cycle in enumerate(cycles):
+            print(f"{i}: {cycle}Z")
+        cycle_index = int(input("Enter index for desired cycle: ").strip())
+        chosen_cycle = cycles[cycle_index]
+        files_for_chosen = sorted([t for t in available if t[0] == chosen_cycle], key=lambda t: int(t[1]))
+        base_date = datetime.strptime(date_str, "%Y%m%d")
+        run_time = base_date + timedelta(hours=int(chosen_cycle))
+        valid_list = []
+        for t in files_for_chosen:
+            fxx = t[1]
+            valid_time = run_time + timedelta(hours=int(fxx))
+            valid_list.append((valid_time, t[2], fxx))
+        print("Available valid times:")
+        for i, (vt, fname, fcst) in enumerate(valid_list):
+            print(f"{i}: {vt.strftime('%Y-%m-%d %HZ')} - File: {fname}")
+        idx = int(input("Enter index for desired valid time: ").strip())
+        vt, fname, fcst = valid_list[idx]
+        file_path = download_model_file(fname, base_url)
+    elif model == "nam":
+        base_url, dates = get_available_nam_dates()
+        if not dates:
+            exit()
+        print("Available NAM dates:")
+        for i, d in enumerate(dates):
+            print(f"{i}: nam.{d}")
+        date_index = int(input("Enter index for desired date: ").strip())
+        chosen_date = dates[date_index]
+        full_url, cycles = get_available_nam_cycle(base_url, chosen_date)
+        if not cycles:
+            exit()
+        print("Available NAM cycles:")
+        for i, cycle in enumerate(cycles):
+            print(f"{i}: {cycle}Z")
+        cycle_index = int(input("Enter index for desired cycle: ").strip())
+        chosen_cycle = cycles[cycle_index]
+        full_url, valid_list = get_available_nam_valid_times(full_url, chosen_cycle, chosen_date)
+        if valid_list is None:
+            exit()
+        print("Available NAM valid times:")
+        for i, (vt, fname, fcst) in enumerate(valid_list):
+            print(f"{i}: {vt.strftime('%Y-%m-%d %HZ')} - File: {fname}")
+        idx = int(input("Enter index for desired valid time: ").strip())
+        vt, fname, fcst = valid_list[idx]
+        file_path = download_model_file(fname, full_url)
+    elif model == "gfs":
+        base_url_gfs, gfs_dates = get_available_gfs_dates()
+        if not gfs_dates:
+            exit()
+        print("Available GFS dates:")
+        for i, d in enumerate(gfs_dates):
+            print(f"{i}: gfs.{d}")
+        date_index = int(input("Enter index for desired date: ").strip())
+        chosen_date = gfs_dates[date_index]
+        base_url_date, cycles = get_available_gfs_cycle(base_url_gfs, chosen_date)
+        if not cycles:
+            exit()
+        print("Available GFS run cycles:")
+        for i, cycle in enumerate(cycles):
+            print(f"{i}: {cycle}Z")
+        cycle_index = int(input("Enter index for desired run cycle: ").strip())
+        chosen_cycle = cycles[cycle_index]
+        final_base_url, valid_list = get_available_gfs_valid_times(base_url_date, chosen_cycle)
+        if valid_list is None:
+            exit()
+        print("Available GFS valid times:")
+        for i, (vt, fname, fcst) in enumerate(valid_list):
+            print(f"{i}: {vt.strftime('%Y-%m-%d %HZ')} - File: {fname}")
+        idx = int(input("Enter index for desired valid time: ").strip())
+        vt, fname, fcst = valid_list[idx]
+        file_path = download_model_file(fname, final_base_url)
+        
     lat = float(input("Enter latitude: ").strip())
     lon = float(input("Enter longitude: ").strip())
-
-    # Ask for model manually
-    model = input("Enter model name (e.g., rap, nam, gfs): ").strip().lower()
     plot_hodograph(file_path, lat, lon, model)
+    input("Press Enter to exit...")

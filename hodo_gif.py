@@ -36,7 +36,7 @@ def get_available_rap_cycles():
             now -= timedelta(days=1)
             continue  # Try previous day
         # Find all GRIB2 files (ignoring .idx files)
-        files = re.findall(r'rap\.t(\d{2})z\.awp130pgrbf(\d{2})\.grib2(?<!\.idx)', response.text)
+        files = re.findall(r'rap\.t(\d{2})z\.awp130pgrbf(\d{2})\.grib2(?<!\.idx)', response.context)
         if not files:
             now -= timedelta(days=1)
             continue
