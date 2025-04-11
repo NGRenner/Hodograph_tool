@@ -93,12 +93,13 @@ def calculate_critical_angle(u_profile, v_profile, z_agl_km, storm_motion):
 # ---------------------
 # Combined Plotting Function
 # ---------------------
+
 def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     """
-    Creates a combined figure with three panels:
+    Creates a combined figure with three panels using nested GridSpec.
       - Left panel (spanning both rows): Skew-T/Log-P diagram.
-      - Top-right panel: Hodograph (with markers, BRM/BLM, height labels, etc.).
-      - Bottom-right panel: A text area for calculated variables.
+      - Top-right panel: Hodograph (with BRM/BLM markers, height labels, etc.).
+      - Bottom-right panel: A text panel of calculated variables.
     Data is taken from the pre-sliced dataset ds.
     """
     # ===== Common Data and Metadata =====
@@ -110,28 +111,31 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     if lon_isobaric.min() >= 0 and lon_isobaric.max() > 180 and lon < 0:
         lon += 360
 
-    # ===== Figure and GridSpec Setup =====
-    fig = plt.figure(figsize=(14, 8))
-    gs = gridspec.GridSpec(nrows=2, ncols=2, width_ratios=[2, 1], height_ratios=[2, 1],
-                           wspace=0.3, hspace=0.3)
-    # Left panel: Skew-T (spanning both rows of column 0)
-    ax_skew = fig.add_subplot(gs[:, 0])
-    # Top-right: Hodograph
-    ax_hodo = fig.add_subplot(gs[0, 1])
-    # Bottom-right: Calculated variables (text); disable axis for clarity
-    ax_calc = fig.add_subplot(gs[1, 1])
-    ax_calc.axis('off')
-
-    # ===== Skew-T/Log-P Plotting (Left Panel) =====
-    # Create a SkewT object on ax_skew.
-    skew = SkewT(fig, subplot=(2,2,1), rotation=45)
-    # Note: Using subplot=(2,2,1) will assign the left-top cell. To make it span both rows,
-    # we can manually adjust its position to fill the entire left column.
-    # For simplicity, we then set the position of ax_skew equal to the SkewT axis.
-    # (Alternatively, if your MetPy version supports the "ax" keyword, try: skew = SkewT(ax=ax_skew, rotation=45))
-    # Here we assume the SkewT object was created successfully.
+    # ===== Outer GridSpec: 1 row x 2 columns =====
+    # Left column will hold the Skew-T; right column will be split vertically.
+    fig = plt.figure(figsize=(16, 8))
+    outer_gs = gridspec.GridSpec(nrows=1, ncols=2, width_ratios=[3, 2], wspace=0.05)
     
-    # Interpolate for Skew-T variables.
+    # Create a nested GridSpec for the right column (2 rows x 1 column)
+    right_gs = gridspec.GridSpecFromSubplotSpec(nrows=2, ncols=1,
+                                                subplot_spec=outer_gs[0, 1],
+                                                height_ratios=[3, 1],
+                                                hspace=0.15)
+    # Reserve axes for the right column.
+    ax_hodo = fig.add_subplot(right_gs[0, 0])
+    ax_calc = fig.add_subplot(right_gs[1, 0])
+    ax_calc.axis('off')  # Hide axes for the text panel.
+
+    # Retrieve the left column bounding box.
+    left_bbox = outer_gs[0, 0].get_position(fig)
+    
+    # ===== Skew-T Panel (Left Column) =====
+    # Since we cannot pass an existing axis to SkewT in our version, we create it with subplot.
+    skew = SkewT(fig, subplot=(1, 2, 1), rotation=45)
+    # Now reposition the SkewT axis to exactly fill the left column.
+    skew.ax.set_position(left_bbox)
+    
+    # ===== Skew-T Data Interpolation and Plotting =====
     levels = [1000, 975, 950, 925, 900, 875, 850, 825, 800, 775,
               750, 725, 700, 675, 650, 625, 600, 575, 550, 525,
               500, 475, 450, 425, 400, 375, 350, 325, 300, 275,
@@ -141,9 +145,11 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     else:
         lat_grid, lon_grid = lat_isobaric, lon_isobaric
 
-    t = ds['t']    # Temperature (K)
-    r = ds['r']    # RH (%)
-    t_interp, r_interp, u_interp_skew, v_interp_skew, z_interp_skew, levs_skew = [], [], [], [], [], []
+    t = ds['t']
+    r = ds['r']
+    t_interp, r_interp = [], []
+    u_interp_skew, v_interp_skew, z_interp_skew = [], [], []
+    levs_skew = []
     for lev in tqdm(levels, desc="Interpolating SkewT Data"):
         if lev not in ds['isobaricInhPa'].values:
             continue
@@ -170,7 +176,7 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     v_interp_skew = np.array(v_interp_skew)
     z_interp_skew = np.array(z_interp_skew)
     levs_skew = np.array(levs_skew)
-
+    
     p_profile = levs_skew * units.hPa
     z_m_skew = (z_interp_skew / 9.80665) * 10.0
     T_kelvin = t_interp * units.K
@@ -187,11 +193,10 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     v_sorted_skew = v_profile_skew[sort_idx]
     z_agl_sorted_skew = (z_agl_m_skew[sort_idx]) * units.meter
 
-    # Plot Skew-T
     skew.plot(p_sorted_skew, T_sorted.to('degC'), color='red', linewidth=2, label='Temperature')
     skew.plot(p_sorted_skew, Td_sorted.to('degC'), color='green', linewidth=2, label='Dewpoint')
     step = max(1, len(p_sorted_skew) // 15)
-    skew.plot_barbs(p_sorted_skew[::step], u_sorted_skew[::step], v_sorted_skew[::step])
+    skew.plot_barbs(p_sorted_skew[::step], u_sorted_skew[::step], v_sorted_skew[::step],xloc=.98)
     p_sfc = p_sorted_skew[0]
     T_sfc = T_sorted[0]
     Td_sfc = Td_sorted[0]
@@ -207,7 +212,7 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     skew.plot_mixing_lines()
     skew.ax.set_title("Skew-T/Log-P Diagram", loc='left', fontsize=11)
 
-    # ===== Hodograph Plotting (Top-Right Panel) =====
+    # ==== Hodograph Plotting (Top-Right Panel) ====
     u = ds['u']
     v = ds['v']
     z = ds['gh']
@@ -299,10 +304,6 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
             va = (interp_func_v(alt) * units('m/s')).to('knots').magnitude
             ax_hodo.scatter(ua, va, color='black', s=30, zorder=12)
             ax_hodo.text(ua + 1.0, va, f"{alt} km", fontsize=9, color='black', ha='left', va='center', zorder=12)
-    ax_hodo.text(0.02, 0.02, f"0–3 km SRH: {srh_val:.0f} m²/s²", transform=ax_hodo.transAxes,
-                 fontsize=10, color='navy', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'), zorder=12)
-    ax_hodo.text(0.02, 0.08, f"Critical Angle: {crit_angle:.1f}°", transform=ax_hodo.transAxes,
-                 fontsize=9, color='darkgreen', bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'), zorder=12)
     ax_hodo.text(rm_u + 1, rm_v, 'BRM', color='red', fontsize=9, va='center', zorder=12)
     ax_hodo.text(lm_u + 1, lm_v, 'BLM', color='blue', fontsize=9, va='center', zorder=12)
     ax_hodo.text(mean_u + 1, mean_v, '0-6km MW', color='green', fontsize=9, va='center', zorder=12)
@@ -311,9 +312,10 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
                  f"VALID: {vt.strftime('%a %Y-%m-%d %HZ')}\nAT: {lat:.2f}°N, {lon:.2f}°{'W' if lon<0 else 'E'}",
                  transform=ax_hodo.transAxes, fontsize=10,
                  verticalalignment='top', horizontalalignment='left',
-                 bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', boxstyle="round,pad=0.3"), color='white', zorder=12)
+                 bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', boxstyle="round,pad=0.3"),
+                 color='white', zorder=12)
 
-    # ===== Calculated Variables Panel (Bottom-Right) =====
+    # ==== Calculated Variables Panel (Bottom-Right) ====
     calc_text = (
         f"CAPE: {cape.to('joules/kilogram').magnitude:.0f} J/kg\n"
         f"CIN: {cin.to('joules/kilogram').magnitude:.0f} J/kg\n"
@@ -324,7 +326,9 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     ax_calc.text(0.05, 0.95, calc_text, ha='left', va='top', fontsize=12,
                  bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
     
-    fig.tight_layout()
+    # ==== Manual Layout Adjustment ====
+    fig.subplots_adjust(left=0.06, right=0.9, top=0.94, bottom=0.06, wspace=0.025, hspace=0.15)
+    
     if output_file:
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
         plt.close(fig)
