@@ -5,6 +5,8 @@ This version opens individual datasets for 'u', 'v', 'gh', 't', and 'r',
 merges them, and loads the dataset into memory with Dask. For each selected
 time slice, it produces a combined figure with the Skew-T/Log-P diagram on the
 left and the hodograph (with all your original labels and markers) on the right.
+
+MOST RECENT PLOTTING SCRIPT
 """
 
 import os
@@ -24,6 +26,7 @@ from metpy.units import units
 import pygrib
 from dask.diagnostics import ProgressBar
 import matplotlib.gridspec as gridspec
+import imageio
 
 # ---------------------
 # Utility Functions
@@ -196,7 +199,7 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     skew.plot(p_sorted_skew, T_sorted.to('degC'), color='red', linewidth=2, label='Temperature')
     skew.plot(p_sorted_skew, Td_sorted.to('degC'), color='green', linewidth=2, label='Dewpoint')
     step = max(1, len(p_sorted_skew) // 15)
-    skew.plot_barbs(p_sorted_skew[::step], u_sorted_skew[::step], v_sorted_skew[::step],xloc=.98)
+    skew.plot_barbs(p_sorted_skew[::step], u_sorted_skew[::step], v_sorted_skew[::step], xloc=1.0)
     p_sfc = p_sorted_skew[0]
     T_sfc = T_sorted[0]
     Td_sfc = Td_sorted[0]
@@ -257,6 +260,8 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     height_profile = z_agl_m * units.meter
     u_knots = u_profile.to('knots').magnitude
     v_knots = v_profile.to('knots').magnitude
+    
+
     interp_func_u = interp1d(z_agl_km, u_interp, kind='linear', bounds_error=False, fill_value="extrapolate")
     interp_func_v = interp1d(z_agl_km, v_interp, kind='linear', bounds_error=False, fill_value="extrapolate")
     u_0 = float((interp_func_u(0.0) * units('m/s')).to('knots').magnitude)
@@ -268,13 +273,28 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     crit_angle = calculate_critical_angle(u_profile, v_profile, z_agl_km, rm)
     hodo = Hodograph(ax_hodo, component_range=80)
     hodo.add_grid(increment=10)
-    ax_hodo.set_xlim(-80, 80)
-    ax_hodo.set_ylim(-80, 80)
-    for ws in range(10, 90, 10):
-        ax_hodo.text(ws, 0, f"{ws}", ha='center', va='bottom', fontsize=9, color='gray')
-        ax_hodo.text(-ws, 0, f"{ws}", ha='center', va='bottom', fontsize=9, color='gray')
-        ax_hodo.text(0, ws, f"{ws}", ha='left', va='center', fontsize=9, color='gray')
-        ax_hodo.text(0, -ws, f"{ws}", ha='left', va='center', fontsize=9, color='gray')
+    #ax_hodo.set_xlim(-80, 80)
+    #ax_hodo.set_ylim(-80, 80)
+   # Dynamic, centered zoom based on u/v data
+    x_center = np.mean(u_knots)
+    y_center = np.mean(v_knots)
+    spread = np.max(np.hypot(u_knots - x_center, v_knots - y_center)) + 10  # tighter zoom, 10 kt buffer
+
+    ax_hodo.set_xlim(x_center - spread, x_center + spread)
+    ax_hodo.set_ylim(y_center - spread, y_center + spread)
+   
+   # Calculate maximum wind magnitude to set plot range
+    wind_mag = np.hypot(u_knots, v_knots)
+    buffer = 10  # knots
+    max_range = np.ceil(np.max(wind_mag) / 10) * 10 + buffer
+    # Draw labels only within the zoomed-in axes range
+    for ws in range(10, int(max_range) + 10, 10):
+        for x, y, ha, va in [(ws, 0, 'center', 'bottom'),
+                            (-ws, 0, 'center', 'bottom'),
+                            (0, ws, 'left', 'center'),
+                            (0, -ws, 'left', 'center')]:
+            if ax_hodo.get_xlim()[0] <= x <= ax_hodo.get_xlim()[1] and ax_hodo.get_ylim()[0] <= y <= ax_hodo.get_ylim()[1]:
+                ax_hodo.text(x, y, f"{ws}", ha=ha, va=va, fontsize=9, color='gray')
     srh_val, _, _ = storm_relative_helicity(height_profile, u_profile, v_profile, 3000 * units.meter,
                                               storm_u=rm[0], storm_v=rm[1])
     idx_3km = np.argmin(np.abs(z_agl_km - 3))
@@ -347,7 +367,7 @@ if __name__ == "__main__":
     root.update()
     root.lift()
     root.attributes('-topmost', True)
-    mode = input("Process (1) a single timestamp or (2) multiple timestamps? Enter 1 or 2: ").strip()
+    mode = input("Process (1) a single timestamp or (2) multiple timestamps or a gif with multiple timestamps? Enter 1 or 2 or 3: ").strip()
     file_path = askopenfilename(title="Select GRIB2 File", filetypes=[("GRIB2 files", "*.grb2"), ("All files", "*.*")])
     if not file_path:
         print("No file selected. Exiting.")
@@ -422,3 +442,30 @@ if __name__ == "__main__":
         print(f"Processing single timestamp: {times[0]}")
         ds_time = ds.isel(time=0) if "time" in ds.dims else ds
         plot_combined(ds_time, file_path, lat, lon, model)
+    if mode == "3":
+        print("GIF Mode: Generating Skew-T + Hodograph GIF")
+        if len(times) == 1:
+            print("The selected file only has one timestamp. Cannot create a GIF.")
+            exit()
+        print("Available time stamps:")
+        for i, t in enumerate(times):
+            print(f"{i}: {t}")
+        start_idx = int(input("Enter start index for GIF (e.g., 0): ").strip())
+        end_idx = int(input("Enter end index for GIF (e.g., 5): ").strip())
+        frame_rate = float(input("Enter frame duration in seconds (e.g., 0.5 for 2 fps): ").strip())
+
+        output_frames = []
+        for idx in range(start_idx, end_idx + 1):
+            selected_time = pd.to_datetime(times[idx])
+            time_str = selected_time.strftime('%Y%m%d_%H%M')
+            filename = f"frame_{time_str}.png"
+            print(f"Generating frame for {selected_time} -> {filename}")
+            ds_time = ds.isel(time=idx)
+            plot_combined(ds_time, file_path, lat, lon, model, output_file=filename)
+            output_frames.append(filename)
+
+        gif_filename = f"combined_plot_{model}_{pd.to_datetime(times[start_idx]).strftime('%Y%m%d_%H%M')}_to_{pd.to_datetime(times[end_idx]).strftime('%Y%m%d_%H%M')}.gif"
+        images = [imageio.imread(f) for f in output_frames if os.path.exists(f)]
+        loop_setting = int(input("Enter loop count (0 for infinite): ").strip())
+        imageio.mimsave(gif_filename, images, duration=frame_rate, loop=loop_setting)
+        print(f"✅ GIF created: {gif_filename}")
