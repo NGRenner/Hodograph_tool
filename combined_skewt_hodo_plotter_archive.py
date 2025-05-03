@@ -458,9 +458,6 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
         shear1_u, shear1_v = bulk_shear(p_sorted_skew, u_sorted_skew, v_sorted_skew, depth=1000 * units.meter)
         shear1_mag = (shear1_u ** 2 + shear1_v ** 2) ** 0.5
 
-        
-        diagnostics.append(f"0–6 km Shear: {shear6_mag.to('knot').magnitude:.1f} kt")
-
     except Exception as e:
         print(f"❌ Failed to calculate bulk shear: {e}")
 
@@ -472,7 +469,6 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
             storm_u=rm[0], storm_v=rm[1]
         )
         srh_1km_val = srh_1km.to('meter**2 / second**2').magnitude
-        diagnostics.append(f"0–1 km SRH: {srh_1km_val:.0f} m²/s²")
     except Exception as e:
         print(f"❌ Failed to calculate 0–1 km SRH: {e}")
 
