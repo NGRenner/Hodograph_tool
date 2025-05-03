@@ -20,17 +20,36 @@ from scipy.interpolate import griddata, interp1d
 import pandas as pd
 import matplotlib.colors as mcolors
 from metpy.plots import Hodograph, SkewT
-from metpy.calc import wind_speed, wind_direction, bunkers_storm_motion, storm_relative_helicity
+from metpy.calc import wind_speed, wind_direction, bunkers_storm_motion, storm_relative_helicity, most_unstable_parcel
 from metpy.calc import dewpoint_from_relative_humidity, parcel_profile, lcl, cape_cin
 from metpy.units import units
 import pygrib
 from dask.diagnostics import ProgressBar
 import matplotlib.gridspec as gridspec
 import imageio
+from metpy.calc import ccl, el, lfc, downdraft_cape
+from metpy.calc import bulk_shear, wind_components
+from metpy.units import units
 
 # ---------------------
 # Utility Functions
 # ---------------------
+def plot_skewt_marker(ax, pressure_hPa, label):
+    """
+    Plots a horizontal marker line and label in the whitespace to the right of the Skew-T profile.
+    """
+    x_axes = 0.85  # Near right edge of plot
+    line_width = 0.03
+
+    ax.axhline(y=pressure_hPa,
+               xmin=x_axes - line_width / 2,
+               xmax=x_axes + line_width / 2,
+               color='black', linewidth=3, zorder=10)
+
+    ax.text(x_axes + line_width / 2 + 0.005, pressure_hPa,
+            label, transform=ax.get_yaxis_transform(),
+            va='center', ha='left', fontsize=13, color='black', zorder=11)
+    
 def get_elevation_pygrib(file_path, lat_target, lon_target):
     grbs = pygrib.open(file_path)
     try:
@@ -203,19 +222,57 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
     p_sfc = p_sorted_skew[0]
     T_sfc = T_sorted[0]
     Td_sfc = Td_sorted[0]
-    lcl_p, lcl_t = lcl(p_sfc, T_sfc, Td_sfc)
-    lcl_height_m = np.interp(lcl_p.m, p_sorted_skew.m[::-1], z_agl_sorted_skew.m[::-1])
+    
     prof = parcel_profile(p_sorted_skew, T_sfc, Td_sfc)
     skew.plot(p_sorted_skew, prof.to('degC'), color='black', linestyle='--', linewidth=2, label='Parcel')
     cape, cin = cape_cin(p_sorted_skew, T_sorted, Td_sorted, prof)
-    skew.shade_cin(p_sorted_skew, T_sorted.to('degC'), prof.to('degC'), color='blue', alpha=0.2)
+    
+    try:
+        el_p, _ = el(p_sorted_skew, T_sorted, Td_sorted)
+        mask_cin = p_sorted_skew >= el_p  # Only shade below EL
+        skew.shade_cin(p_sorted_skew[mask_cin], T_sorted[mask_cin].to('degC'), prof[mask_cin].to('degC'), color='blue', alpha=0.2)
+    except Exception as e:
+        print(f"❌ EL shading mask failed: {e}")
+
     skew.shade_cape(p_sorted_skew, T_sorted.to('degC'), prof.to('degC'), color='red', alpha=0.2)
     skew.plot_dry_adiabats()
     skew.plot_moist_adiabats()
     skew.plot_mixing_lines()
     skew.ax.set_title("Skew-T/Log-P Diagram", loc='left', fontsize=11)
+ 
+    # Add height labels aligned to left margin (axes coordinates)
+    # Match to pressure levels using hypsometric approximation
+    height_labels_km = np.arange(1, 17)
+    height_labels_m = height_labels_km * 1000 * units.meter
 
-    # ==== Hodograph Plotting (Top-Right Panel) ====
+    # Hypsometric approximation (standard atmosphere)
+    p0 = 1000 * units.hPa
+    T0 = 288.15 * units.kelvin
+    L = 0.0065 * units.kelvin / units.meter
+    g = 9.80665 * units.meter / (units.second ** 2)
+    R = 287.05 * units.joule / (units.kilogram * units.kelvin)
+
+    exponent = (g / (R * L)).to_base_units().magnitude
+    p_heights = p0 * (1 - (L * height_labels_m / T0)).to_base_units() ** exponent
+
+    # Normalize to log-pressure axis
+    log_p_heights = np.log10(p_heights.magnitude)
+    log_p_min = np.log10(skew.ax.get_ylim()[1])  # e.g., 100 hPa
+    log_p_max = np.log10(skew.ax.get_ylim()[0])  # e.g., 1000 hPa
+
+    # Axes y-coords in 0–1 for placement
+    y_coords = (log_p_max - log_p_heights) / (log_p_max - log_p_min)
+
+    # Plot using axes coordinates
+    for h, y in zip(height_labels_km, y_coords):
+        if 0 <= y <= 1:
+            skew.ax.text(
+                0.01, y, f"{h} km",
+                transform=skew.ax.transAxes,
+                va='center', ha='left', fontsize=9, color='gray'
+            )
+
+            # ==== Hodograph Plotting (Top-Right Panel) ====
     u = ds['u']
     v = ds['v']
     z = ds['gh']
@@ -334,17 +391,108 @@ def plot_combined(ds, file_path, lat, lon, model, output_file=None):
                  verticalalignment='top', horizontalalignment='left',
                  bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', boxstyle="round,pad=0.3"),
                  color='white', zorder=12)
+   
+   
+    # DCAPE
+    try:
+        dcape_val, _, _ = downdraft_cape(p_sorted_skew, T_sorted, Td_sorted)
+       
+        print(f"✅ DCAPE: {dcape_val}")
+    except Exception as e:
+        print(f"❌ Failed to calculate DCAPE: {e}")
 
-    # ==== Calculated Variables Panel (Bottom-Right) ====
-    calc_text = (
-        f"CAPE: {cape.to('joules/kilogram').magnitude:.0f} J/kg\n"
-        f"CIN: {cin.to('joules/kilogram').magnitude:.0f} J/kg\n"
-        f"LCL: {lcl_height_m:.0f} m AGL\n"
-        f"0-3 km SRH: {srh_val:.0f} m²/s²\n"
-        f"Crit. Angle: {crit_angle:.1f}°"
-    )
+    # --- CCL + Convective Temp ---
+    try:
+        ccl_result = ccl(p_sorted_skew, T_sorted, Td_sorted)
+        ccl_p = ccl_result[0]
+        ccl_temp = ccl_result[2]
+        ccl_pressure = ccl_p.to('hPa').magnitude
+        #plot_skewt_marker(skew.ax, ccl_pressure, "CCL")
+    except Exception as e:
+        print(f"❌ Failed to calculate CCL or Convective Temp: {e}")
+        ccl_temp = np.nan * units.degC
+
+    # --- EL ---
+    try:
+        el_p, _ = el(p_sorted_skew, T_sorted, Td_sorted)
+        el_pressure = el_p.to('hPa').magnitude
+        plot_skewt_marker(skew.ax, el_pressure, "EL")
+    except Exception as e:
+        print(f"❌ Failed to calculate EL: {e}")
+
+    # --- LFC ---
+    try:
+        lfc_p, _ = lfc(p_sorted_skew, T_sorted, Td_sorted, prof)
+        lfc_pressure = lfc_p.to('hPa').magnitude
+        plot_skewt_marker(skew.ax, lfc_pressure, "LFC")
+    except Exception as e:
+        print(f"❌ Failed to calculate LFC: {e}")
+    
+        # ==== LCL ====
+    try:
+        # Surface values
+        p_sfc = p_sorted_skew[0]
+        T_sfc = T_sorted[0]
+        Td_sfc = Td_sorted[0]
+
+        # Calculate LCL pressure and temperature
+        lcl_p, lcl_t = lcl(p_sfc, T_sfc, Td_sfc)
+        lcl_pressure = lcl_p.to('hPa').magnitude
+
+        # Interpolated height AGL (optional, already used earlier if needed)
+        lcl_height_m = np.interp(lcl_p.m, p_sorted_skew.m[::-1], z_agl_sorted_skew.m[::-1])
+
+        # Plot marker
+        plot_skewt_marker(skew.ax, lcl_pressure, "LCL")
+
+    except Exception as e:
+        print(f"❌ Failed to calculate LCL: {e}")
+        
+   # ==== Bulk Shear (0–1 km and 0–6 km) ====
+    try:
+        # 0–6 km shear
+        shear6_u, shear6_v = bulk_shear(p_sorted_skew, u_sorted_skew, v_sorted_skew, depth=6000 * units.meter)
+        shear6_mag = (shear6_u ** 2 + shear6_v ** 2) ** 0.5
+
+        # 0–1 km shear
+        shear1_u, shear1_v = bulk_shear(p_sorted_skew, u_sorted_skew, v_sorted_skew, depth=1000 * units.meter)
+        shear1_mag = (shear1_u ** 2 + shear1_v ** 2) ** 0.5
+
+        
+        diagnostics.append(f"0–6 km Shear: {shear6_mag.to('knot').magnitude:.1f} kt")
+
+    except Exception as e:
+        print(f"❌ Failed to calculate bulk shear: {e}")
+
+        # ==== 0–1 km SRH ====
+    try:
+        srh_1km, _, _ = storm_relative_helicity(
+            height_profile, u_profile, v_profile,
+            depth=1000 * units.meter,
+            storm_u=rm[0], storm_v=rm[1]
+        )
+        srh_1km_val = srh_1km.to('meter**2 / second**2').magnitude
+        diagnostics.append(f"0–1 km SRH: {srh_1km_val:.0f} m²/s²")
+    except Exception as e:
+        print(f"❌ Failed to calculate 0–1 km SRH: {e}")
+
+    diagnostics = [
+        f"CAPE: {cape.to('joules/kilogram').magnitude:.0f} J/kg",
+        f"DCAPE: {dcape_val.to('joules/kilogram').magnitude:.0f} J/kg",
+        f"CIN: {cin.to('joules/kilogram').magnitude:.0f} J/kg",
+        f"Conv. Temp: {ccl_temp.to('degC').magnitude:.1f}°C",
+        f"0–1 km SRH: {srh_1km_val:.0f} m²/s²",
+        f"0–3 km SRH: {srh_val.to('meter**2 / second**2').magnitude:.0f} m²/s²",
+        f"Crit. Angle: {crit_angle:.1f}°",
+        f"0–1 km Shear: {shear1_mag.to('knot').magnitude:.1f} kt",
+        f"0–6 km Shear: {shear6_mag.to('knot').magnitude:.1f} kt"
+        
+]
+
+    # === Final display ===
+    calc_text = "\n".join(diagnostics)
     ax_calc.text(0.05, 0.95, calc_text, ha='left', va='top', fontsize=12,
-                 bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+                bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
     
     # ==== Manual Layout Adjustment ====
     fig.subplots_adjust(left=0.06, right=0.9, top=0.94, bottom=0.06, wspace=0.025, hspace=0.15)
